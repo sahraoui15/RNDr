@@ -18,7 +18,7 @@ const PI_API = "https://api.minepi.com/v2";
 const PI_KEY = env.PI_API_KEY;
 
 /* العناوين المسموح لها باستدعاء السيرفر (واجهة GitHub Pages) */
-const ORIGINS = (env.ALLOWED_ORIGIN || "https://veoabdo.github.io")
+const ORIGINS = (env.ALLOWED_ORIGIN || "https://parfum314.github.io")
   .split(",").map(s => s.trim().replace(/\/$/, "")).filter(Boolean);
 
 /* ===== Firebase ===== */
