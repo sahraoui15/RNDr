@@ -86,6 +86,7 @@ const clean = (v, max) => String(v ?? "").replace(/[\u0000-\u001F]/g, " ").trim(
 const isImg = u => typeof u === "string" && u.startsWith("https://res.cloudinary.com/");
 const cleanImgs = (arr, one) => { const a = (Array.isArray(arr) ? arr : []).filter(isImg); if (!a.length && isImg(one)) a.push(one); return [...new Set(a)].slice(0, 3); };
 const imgsOf = d => (d && d.images && d.images.length ? d.images : (d && d.image ? [d.image] : []));
+const ratingAvg = d => (Number(d.ratingCount) > 0 ? Number(((Number(d.ratingSum) || 0) / Number(d.ratingCount)).toFixed(1)) : 0);
 const isMapUrl = u => { try { const x = new URL(u); return x.protocol === "https:" && /^(([a-z0-9-]+\.)*google\.(com|[a-z]{2}|com\.[a-z]{2}|co\.[a-z]{2})|maps\.app\.goo\.gl|goo\.gl)$/i.test(x.hostname); } catch { return false; } };
 const wrap = fn => async (req, res) => {
   try { await fn(req, res); }
@@ -122,8 +123,8 @@ async function adminOnly(req, res) {
   return u;
 }
 
-const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.region, address: d.address, phone: d.phone, hours: d.hours || "", description: d.description || "", image: d.image || "", images: imgsOf(d), mapUrl: d.mapUrl || "" });
-const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "", images: imgsOf(d), createdAt: d.createdAt || 0 });
+const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.region, address: d.address, phone: d.phone, hours: d.hours || "", description: d.description || "", image: d.image || "", images: imgsOf(d), rAvg: ratingAvg(d), rCount: Number(d.ratingCount) || 0, mapUrl: d.mapUrl || "" });
+const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "", images: imgsOf(d), rAvg: ratingAvg(d), rCount: Number(d.ratingCount) || 0, createdAt: d.createdAt || 0 });
 /* كاش قصير لقائمة المحلات العامة (يُمسح عند أي تغيير) لتقليل قراءات Firestore */
 const SHOPS_TTL = 30000;
 let shopsCache = { t: 0, d: null };
@@ -295,6 +296,7 @@ app.post("/api/product/delete", wrap(async (req, res) => {
   const s = await ref.get();
   if (!s.exists || s.data().ownerUid !== u.uid) return res.status(403).json({ error: "Not your product" });
   for (const o of imgsOf(s.data())) await destroyImage(o, u.uid);
+    await purgeReviews(ref.id);
   await ref.delete();
   bustShops();
   res.json({ success: true });
@@ -340,6 +342,76 @@ app.post("/api/product/claim-free", wrap(async (req, res) => {
   });
   if (free) bustShops();
   res.json({ success: true, free });
+}));
+/* ===== التقييمات والتعليقات (تقييم واحد لكل مستخدم) ===== */
+const rvTarget = (type, id) => db.collection(type === "shop" ? "shops" : "products").doc(String(id));
+
+app.get("/api/reviews", wrap(async (req, res) => {
+  if (ipLimited(req, res, "rv_get", 120, 60000)) return;
+  const type = String(req.query.type || ""), id = String(req.query.id || "");
+  if (!["shop", "product"].includes(type) || !id) return res.status(400).json({ error: "Bad request" });
+  const [tg, q] = await Promise.all([
+    rvTarget(type, id).get(),
+    db.collection("reviews").where("targetId", "==", id).get()
+  ]);
+  if (!tg.exists) return res.status(404).json({ error: "Not found" });
+  const reviews = q.docs.map(d => d.data()).filter(x => x.type === type)
+    .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0))
+    .slice(0, 100)
+    .map(x => ({ uid: x.uid, username: x.username, rating: x.rating, text: x.text || "", createdAt: x.createdAt || 0, updatedAt: x.updatedAt || 0 }));
+  const d = tg.data();
+  const count = Number(d.ratingCount) || 0;
+  res.json({ reviews, avg: ratingAvg(d), count, ownerUid: d.ownerUid || "" });
+}));
+
+app.post("/api/review/save", wrap(async (req, res) => {
+  const u = await auth(req, res); if (!u) return;
+  if (limited("rv_" + u.uid, 30, 3600000)) return res.status(429).json({ error: "Too many requests" });
+  const type = String(req.body.type || ""), id = String(req.body.targetId || "");
+  const rating = Math.round(Number(req.body.rating));
+  const text = clean(req.body.text, 400);
+  if (!["shop", "product"].includes(type) || !id || !(rating >= 1 && rating <= 5))
+    return res.status(400).json({ error: "Bad request" });
+  const tref = rvTarget(type, id);
+  const rref = db.collection("reviews").doc(type + "_" + id + "_" + u.uid);
+  const out = await db.runTransaction(async t => {
+    const [ts, rs] = await Promise.all([t.get(tref), t.get(rref)]);
+    if (!ts.exists || ts.data().status !== "live") return { error: "Not available" };
+    if (ts.data().ownerUid === u.uid) return { error: "You cannot review your own shop or perfume" };
+    const old = rs.exists ? Number(rs.data().rating) || 0 : 0;
+    const sum = (Number(ts.data().ratingSum) || 0) - old + rating;
+    const count = (Number(ts.data().ratingCount) || 0) + (rs.exists ? 0 : 1);
+    t.update(tref, { ratingSum: sum, ratingCount: count });
+    t.set(rref, { type, targetId: id, uid: u.uid, username: u.username, rating, text,
+      createdAt: rs.exists ? rs.data().createdAt : Date.now(), updatedAt: Date.now() });
+    return { avg: Number((sum / count).toFixed(1)), count };
+  });
+  if (out.error) return res.status(400).json({ error: out.error });
+  bustShops();
+  res.json({ success: true, ...out });
+}));
+
+app.post("/api/review/delete", wrap(async (req, res) => {
+  const u = await auth(req, res); if (!u) return;
+  const type = String(req.body.type || ""), id = String(req.body.targetId || "");
+  const who = String(req.body.reviewUid || u.uid);
+  if (!["shop", "product"].includes(type) || !id) return res.status(400).json({ error: "Bad request" });
+  if (who !== u.uid && !u.isAdmin) return res.status(403).json({ error: "Not allowed" });
+  const tref = rvTarget(type, id);
+  const rref = db.collection("reviews").doc(type + "_" + id + "_" + who);
+  await db.runTransaction(async t => {
+    const [ts, rs] = await Promise.all([t.get(tref), t.get(rref)]);
+    if (!rs.exists) return;
+    if (ts.exists) {
+      t.update(tref, {
+        ratingSum: Math.max(0, (Number(ts.data().ratingSum) || 0) - (Number(rs.data().rating) || 0)),
+        ratingCount: Math.max(0, (Number(ts.data().ratingCount) || 0) - 1)
+      });
+    }
+    t.delete(rref);
+  });
+  bustShops();
+  res.json({ success: true });
 }));
 /* ===== الدفع (المستخدم إلى التطبيق) ===== */
 async function getPayment(id) {
@@ -693,8 +765,13 @@ async function destroyImage(url, ownerUid) {
   try { await cloudinary.v2.uploader.destroy(id, { invalidate: true }); }
   catch (e) { console.error("cloudinary destroy:", id, errInfo(e)); }
 }
+async function purgeReviews(id) {
+  const q = await db.collection("reviews").where("targetId", "==", String(id)).get();
+  for (const d of q.docs) await d.ref.delete();
+}
 async function purgeDoc(ref, data) {
   for (const o of imgsOf(data)) await destroyImage(o, data && data.ownerUid);
+  await purgeReviews(ref.id);
   await ref.delete();
 }
 
