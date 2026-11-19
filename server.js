@@ -13,6 +13,9 @@ const env = process.env;
 const SHOP_FEE = Number(env.SHOP_FEE || 5);          // رسوم فتح المحل
 const PRODUCT_FEE = Number(env.PRODUCT_FEE || 0.25); // رسوم إضافة منتج (غير قابلة للاسترجاع أبداً)
 const REFUND_DEDUCT = Number(env.REFUND_DEDUCT ?? 0.01); // خصم رسوم الشبكة من استرجاع رسوم فتح المحل
+const FREE_SHOPS = Number(env.FREE_SHOPS ?? 10);          // عدد المحلات المجانية الأولى
+const FREE_PRODUCTS = Number(env.FREE_PRODUCTS ?? 1);     // عدد العطور المجانية لكل محل مجاني
+const FREE_PRODUCT_ALL = env.FREE_PRODUCT_ALL === "true"; // true = العطر المجاني لكل المحلات
 const ADMINS = (env.ADMIN_USERNAMES || "").split(",").map(s => s.trim().replace(/^@/, "").toLowerCase()).filter(Boolean);
 const PI_API = "https://api.minepi.com/v2";
 const PI_KEY = env.PI_API_KEY;
@@ -157,14 +160,17 @@ app.use(express.json({ limit: "6mb" }));
 app.get("/", (_, res) => res.send("Parfum API is running"));
 app.get("/health", (_, res) => res.json({ ok: true, app: "Parfum" }));
 
-app.get("/api/config", (_, res) => {
+app.get("/api/config", wrap(async (_, res) => {
+  let used = 0;
+  try { const m = await db.collection("meta").doc("promo").get(); if (m.exists) used = Number(m.data().used) || 0; } catch {}
   res.json({
     shopFee: SHOP_FEE, productFee: PRODUCT_FEE,
     refundDeduct: REFUND_DEDUCT,
-    sandbox: env.PI_SANDBOX === "true"
+    sandbox: env.PI_SANDBOX === "true",
+    freeLeft: Math.max(0, FREE_SHOPS - used),
+    freeProducts: FREE_PRODUCTS, freeProductAll: FREE_PRODUCT_ALL
   });
-});
-
+}));
 /* المحلات المنشورة مع منتجاتها المنشورة (المحلات قيد المراجعة لا تظهر) */
 app.get("/api/shops", wrap(async (_, res) => {
   if (shopsCache.d && Date.now() - shopsCache.t < SHOPS_TTL) return res.json(shopsCache.d);
@@ -293,7 +299,48 @@ app.post("/api/product/delete", wrap(async (req, res) => {
   bustShops();
   res.json({ success: true });
 }));
+/* ===== عرض المحلات والعطور المجانية ===== */
+app.post("/api/shop/claim-free", wrap(async (req, res) => {
+  const u = await auth(req, res); if (!u) return;
+  const ref = db.collection("shops").doc(u.uid);
+  const meta = db.collection("meta").doc("promo");
+  const free = await db.runTransaction(async t => {
+    const s = await t.get(ref);
+    const m = await t.get(meta);
+    if (!s.exists || s.data().status !== "unpaid") return false;
+    const d = s.data();
+    const used = m.exists ? Number(m.data().used) || 0 : 0;
+    if (!d.promo) {
+      if (used >= FREE_SHOPS) return false;
+      t.set(meta, { used: used + 1 }, { merge: true });
+    }
+    t.update(ref, { status: "pending", feePaid: true, promo: true, reviewMessage: "", submittedAt: Date.now() });
+    return true;
+  });
+  if (free) bustShops();
+  res.json({ success: true, free });
+}));
 
+app.post("/api/product/claim-free", wrap(async (req, res) => {
+  const u = await auth(req, res); if (!u) return;
+  const pref = db.collection("products").doc(String(req.body.id || ""));
+  const sref = db.collection("shops").doc(u.uid);
+  const free = await db.runTransaction(async t => {
+    const p = await t.get(pref);
+    const s = await t.get(sref);
+    if (!p.exists || p.data().ownerUid !== u.uid || p.data().status !== "unpaid") return false;
+    if (!s.exists || s.data().status !== "live") return false;
+    const sd = s.data();
+    if (!(sd.promo || FREE_PRODUCT_ALL)) return false;
+    const used = Number(sd.freeUsed) || 0;
+    if (used >= FREE_PRODUCTS) return false;
+    t.update(sref, { freeUsed: used + 1 });
+    t.update(pref, { status: "live", feePaid: true, freeProduct: true, publishedAt: Date.now() });
+    return true;
+  });
+  if (free) bustShops();
+  res.json({ success: true, free });
+}));
 /* ===== الدفع (المستخدم إلى التطبيق) ===== */
 async function getPayment(id) {
   const r = await fetch(`${PI_API}/payments/${encodeURIComponent(id)}`, { headers: { Authorization: `Key ${PI_KEY}` } });
@@ -391,7 +438,7 @@ app.post("/api/admin/list", wrap(async (req, res) => {
     return {
       id: d.id, name: x.name, country: x.country, region: x.region, ownerUsername: x.ownerUsername, status: x.status,
       image: x.image || "", address: x.address || "", phone: x.phone || "", hours: x.hours || "", description: x.description || "",
-      createdAt: x.createdAt || 0, submittedAt: x.submittedAt || 0
+      createdAt: x.createdAt || 0, submittedAt: x.submittedAt || 0, promo: !!x.promo
     };
   }).sort((a, b) => b.createdAt - a.createdAt);
   const products = p.docs.map(d => {
