@@ -124,7 +124,7 @@ async function adminOnly(req, res) {
 }
 
 const pubShop = (id, d) => ({ id, name: d.name, country: d.country, region: d.region, address: d.address, phone: d.phone, hours: d.hours || "", description: d.description || "", image: d.image || "", images: imgsOf(d), rAvg: ratingAvg(d), rCount: Number(d.ratingCount) || 0, mapUrl: d.mapUrl || "" });
-const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "", images: imgsOf(d), rAvg: ratingAvg(d), rCount: Number(d.ratingCount) || 0, createdAt: d.createdAt || 0 });
+const pubProd = (id, d) => ({ id, name: d.name, brand: d.brand || "", size: d.size || "", gender: d.gender || "unisex", price: d.price, currency: d.currency || "", description: d.description || "", image: d.image || "", images: imgsOf(d), rAvg: ratingAvg(d), rCount: Number(d.ratingCount) || 0, createdAt: d.createdAt || 0 });
 /* كاش قصير لقائمة المحلات العامة (يُمسح عند أي تغيير) لتقليل قراءات Firestore */
 const SHOPS_TTL = 30000;
 let shopsCache = { t: 0, d: null };
@@ -264,7 +264,8 @@ app.post("/api/product/save", wrap(async (req, res) => {
   const data = {
     name: clean(b.name, 80), brand: clean(b.brand, 60), size: clean(b.size, 30),
     price, currency: ({ PI: "Pi", OUSD: "OUSD" })[clean(b.currency, 6).toUpperCase()] || "", description: clean(b.description, 400),
-    images: cleanImgs(b.images, b.image), image: cleanImgs(b.images, b.image)[0] || ""
+        images: cleanImgs(b.images, b.image), image: cleanImgs(b.images, b.image)[0] || "",
+    gender: ["men", "women", "unisex"].includes(String(b.gender)) ? String(b.gender) : "unisex"
   };
   if (!data.name || !(price > 0 && price < 1e9) || !data.currency || !data.image)
     return res.status(400).json({ error: "Please complete all required fields (including the product photo)" });
